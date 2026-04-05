@@ -1,48 +1,74 @@
-import fitz
-from langchain_core.documents import Document
-from transformers import CLIPProcessor, CLIPModel
-from transformers import BlipProcessor, BlipForConditionalGeneration
-from PIL import Image
-import torch
+import fitz  # PyMuPDF
 import numpy as np
 import base64
 import io
+import torch
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
+
+from langchain_core.documents import Document
 from langchain_community.vectorstores import FAISS
-from langchain_core.messages import HumanMessage
-
-from dotenv import load_dotenv
-load_dotenv()
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from langchain_huggingface import ChatHuggingFace, HuggingFaceEndpoint
 
-# ---------------- LLM ----------------
-llm = HuggingFaceEndpoint(
-    repo_id="meta-llama/Meta-Llama-3.1-8B-Instruct",
-    task="text-generation"
-)
 
-model = ChatHuggingFace(llm=llm)
+# =========================
+# GLOBAL MODEL CACHE
+# =========================
 
-# ---------------- CLIP ----------------
-clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-clip_model.eval()
+_clip_model = None
+_clip_processor = None
+_llm = None
+_model = None
+_vector_store = None
+_image_store = None
 
-# ---------------- BLIP (IMAGE UNDERSTANDING) ----------------
-blip_processor = BlipProcessor.from_pretrained(
-    "Salesforce/blip-image-captioning-base"
-)
 
-blip_model = BlipForConditionalGeneration.from_pretrained(
-    "Salesforce/blip-image-captioning-base"
-)
+def load_clip():
+    global _clip_model, _clip_processor
 
-blip_model.eval()
+    if _clip_model is None:
+        _clip_model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
+        _clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+        _clip_model.eval()
 
-# ---------------- EMBEDDING ----------------
+    return _clip_model, _clip_processor
+
+
+def load_llm():
+    global _llm, _model
+
+    if _model is None:
+        _llm = HuggingFaceEndpoint(
+            repo_id="meta-llama/Meta-Llama-3.1-8B-Instruct",
+            task="text-generation"
+        )
+        _model = ChatHuggingFace(llm=_llm)
+
+    return _model
+
+
+# =========================
+# EMBEDDINGS
+# =========================
+
+def embed_image(image):
+    clip_model, clip_processor = load_clip()
+
+    inputs = clip_processor(images=image, return_tensors="pt")
+
+    with torch.no_grad():
+        features = clip_model.get_image_features(**inputs)
+
+    features = features / features.norm(dim=-1, keepdim=True)
+    return features.squeeze().cpu().numpy()
+
+
 def embed_text(text):
+    clip_model, clip_processor = load_clip()
+
     inputs = clip_processor(
         text=[text],
         return_tensors="pt",
@@ -58,47 +84,28 @@ def embed_text(text):
     return features.squeeze().cpu().numpy()
 
 
-def embed_image(image):
-    image = image.convert("RGB")
+# =========================
+# BUILD INDEX (MAIN FIX)
+# =========================
 
-    inputs = clip_processor(images=image, return_tensors="pt")
+def build_index(pdf_path: str):
+    global _vector_store, _image_store
 
-    with torch.no_grad():
-        features = clip_model.get_image_features(**inputs)
-
-    features = features / features.norm(dim=-1, keepdim=True)
-    return features.squeeze().cpu().numpy()
-
-# ---------------- BLIP IMAGE CAPTION ----------------
-def ask_blip(image_bytes):
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-    inputs = blip_processor(images=image, return_tensors="pt")
-
-    with torch.no_grad():
-        output = blip_model.generate(**inputs)
-
-    caption = blip_processor.decode(output[0], skip_special_tokens=True)
-
-    return caption
-
-# ---------------- PDF PROCESS ----------------
-def process_pdf(pdf_path):
     doc = fitz.open(pdf_path)
-
-    all_docs = []
-    all_embeddings = []
-    image_data_store = {}
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=500,
         chunk_overlap=100
     )
 
+    all_docs = []
+    all_embeddings = []
+    image_store = {}
+
     for i, page in enumerate(doc):
-        text = page.get_text()
 
         # -------- TEXT --------
+        text = page.get_text()
         if text.strip():
             temp_doc = Document(
                 page_content=text,
@@ -109,50 +116,46 @@ def process_pdf(pdf_path):
 
             for chunk in chunks:
                 emb = embed_text(chunk.page_content)
-                all_embeddings.append(emb)
                 all_docs.append(chunk)
+                all_embeddings.append(emb)
 
         # -------- IMAGES --------
         for img_index, img in enumerate(page.get_images(full=True)):
             try:
                 xref = img[0]
-                base_image = doc.extract_image(xref)
-                image_bytes = base_image["image"]
+                base = doc.extract_image(xref)
+                image_bytes = base["image"]
 
-                pil_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+                pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+                # store base64
+                buffer = io.BytesIO()
+                pil_img.save(buffer, format="PNG")
+                img_base64 = base64.b64encode(buffer.getvalue()).decode()
 
                 image_id = f"page_{i}_img_{img_index}"
+                image_store[image_id] = img_base64
 
-                # store image for UI
-                buffered = io.BytesIO()
-                pil_image.save(buffered, format="PNG")
-                image_data_store[image_id] = base64.b64encode(
-                    buffered.getvalue()
-                ).decode()
+                emb = embed_image(pil_img)
 
-                # CLIP embedding
-                emb = embed_image(pil_image)
-                all_embeddings.append(emb)
-
-                image_doc = Document(
-                    page_content=f"[Image: {image_id}]",
-                    metadata={
-                        "page": i,
-                        "type": "image",
-                        "image_id": image_id
-                    }
+                all_docs.append(
+                    Document(
+                        page_content=f"[Image: {image_id}]",
+                        metadata={"page": i, "type": "image", "image_id": image_id}
+                    )
                 )
 
-                all_docs.append(image_doc)
+                all_embeddings.append(emb)
 
-            except:
-                continue
+            except Exception as e:
+                print("Image error:", e)
 
     doc.close()
 
     embeddings_array = np.array(all_embeddings)
 
-    vector_store = FAISS.from_embeddings(
+    # FAISS store
+    _vector_store = FAISS.from_embeddings(
         text_embeddings=[
             (doc.page_content, emb)
             for doc, emb in zip(all_docs, embeddings_array)
@@ -161,73 +164,65 @@ def process_pdf(pdf_path):
         metadatas=[doc.metadata for doc in all_docs]
     )
 
-    return vector_store, image_data_store
+    _image_store = image_store
 
-# ---------------- RETRIEVE ----------------
-def retrieve_multimodal(query, vector_store, k=5):
+    return _vector_store, _image_store
+
+
+# =========================
+# RETRIEVAL
+# =========================
+
+def retrieve(query, k=5):
     query_emb = embed_text(query)
 
-    return vector_store.similarity_search_by_vector(
+    results = _vector_store.similarity_search_by_vector(
         embedding=query_emb,
         k=k
     )
 
-# ---------------- PROMPT ----------------
-def create_text_message(query, context_docs):
+    return results
+
+
+# =========================
+# PROMPT
+# =========================
+
+def create_message(query, docs):
     context = ""
 
-    for doc in context_docs:
-        if doc.metadata["type"] == "text":
-            context += doc.page_content + "\n"
+    for d in docs:
+        if d.metadata["type"] == "text":
+            context += f"[Page {d.metadata['page']}]\n{d.page_content}\n\n"
         else:
-            context += f"[Image: {doc.metadata['image_id']}]\n"
+            context += f"[Image: {d.metadata.get('image_id')}]\n"
 
     prompt = f"""
-Answer the question based on the context:
+Answer the question using the context.
 
+Context:
 {context}
 
-Question: {query}
+Question:
+{query}
 """
 
-    return [HumanMessage(content=prompt)]
+    return [prompt]
 
-# ---------------- MAIN PIPELINE ----------------
-def multimodal_pipeline(query, vector_store=None, image_bytes=None):
 
-    context_docs = []
-    pdf_answer = ""
+# =========================
+# PIPELINE
+# =========================
 
-    # -------- PDF PART --------
-    if vector_store is not None:
-        context_docs = retrieve_multimodal(query, vector_store, k=5)
-        message = create_text_message(query, context_docs)
-        response = model.invoke(message)
-        pdf_answer = response.content
+def multimodal_pdf_rag_pipeline(query):
+    global _model
 
-    # -------- IMAGE PART (BLIP) --------
-    image_answer = ""
-    if image_bytes is not None:
-        caption = ask_blip(image_bytes)
-        image_answer = f"🖼️ Image Description: {caption}"
+    model = load_llm()
 
-    # -------- FINAL RESPONSE --------
-    if pdf_answer and image_answer:
-        final_answer = f"""
-📄 PDF Understanding:
-{pdf_answer}
+    docs = retrieve(query)
 
-🖼️ Image Understanding:
-{image_answer}
-"""
+    message = create_message(query, docs)
 
-    elif pdf_answer:
-        final_answer = pdf_answer
+    response = model.invoke(message)
 
-    elif image_answer:
-        final_answer = image_answer
-
-    else:
-        final_answer = "No input provided."
-
-    return final_answer, context_docs
+    return response.content

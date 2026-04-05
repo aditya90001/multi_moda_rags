@@ -1,141 +1,74 @@
 import streamlit as st
-from PIL import Image
 import tempfile
-import time
 
-# Backend
-from rag_pipeline import process_pdf, multimodal_pipeline
-
-# ---------------- CONFIG ----------------
-st.set_page_config(page_title="Multimodal RAG Chat", layout="wide")
-
-st.title("🧠 Multimodal RAG Chat (CLIP + BLIP + LLaMA)")
-st.caption("PDF + Image AI Chat System 🚀 (No LLaVA, fully stable)")
-
-# ---------------- SESSION ----------------
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-
-# ---------------- SIDEBAR ----------------
-st.sidebar.header("⚙️ Controls")
-
-mode = st.sidebar.radio(
-    "Select Mode",
-    ["📄 PDF Chat", "🖼️ Image Search", "🔀 Multimodal"]
+from rag_pipeline import (
+    build_index,
+    multimodal_pdf_rag_pipeline
 )
 
-uploaded_pdf = st.sidebar.file_uploader("Upload PDF", type=["pdf"])
-uploaded_image = st.sidebar.file_uploader("Upload Image", type=["png", "jpg", "jpeg"])
+st.set_page_config(page_title="Multimodal RAG", layout="wide")
 
-# Clear chat
-if st.sidebar.button("🧹 Clear Chat"):
-    st.session_state.messages = []
-    st.rerun()
+st.title("📄🔍 Multimodal PDF RAG (CLIP + FAISS + LLM)")
 
-# ---------------- PROCESS PDF ----------------
-if uploaded_pdf:
+
+# =========================
+# SESSION STATE
+# =========================
+
+if "index_built" not in st.session_state:
+    st.session_state.index_built = False
+
+if "pdf_path" not in st.session_state:
+    st.session_state.pdf_path = None
+
+
+# =========================
+# UPLOAD PDF
+# =========================
+
+uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+
+if uploaded_file:
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(uploaded_pdf.read())
+        tmp.write(uploaded_file.read())
         pdf_path = tmp.name
 
-    st.sidebar.success("Processing PDF... ⏳")
+    st.session_state.pdf_path = pdf_path
 
-    vector_store, image_data_store = process_pdf(pdf_path)
+    if st.button("🚀 Build Index"):
+        with st.spinner("Building embeddings (CLIP + FAISS)... this may take time"):
+            build_index(pdf_path)
+            st.session_state.index_built = True
 
-    st.session_state.vector_store = vector_store
-    st.sidebar.success("✅ PDF Ready!")
+        st.success("Index built successfully!")
 
-# ---------------- IMAGE HANDLING ----------------
-image_bytes = None
-image = None
 
-if uploaded_image:
-    image_bytes = uploaded_image.getvalue()
-    image = Image.open(uploaded_image)
+# =========================
+# QUERY SECTION
+# =========================
 
-    st.sidebar.image(image, caption="Uploaded Image", use_container_width=True)
+if st.session_state.index_built:
 
-# ---------------- CHAT HISTORY ----------------
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
+    st.subheader("Ask Questions")
 
-# ---------------- USER INPUT ----------------
-user_input = st.chat_input("Ask something...")
+    query = st.text_input("Enter your question")
 
-if user_input:
+    if st.button("Get Answer"):
 
-    # ---------------- VALIDATION ----------------
-    if mode == "📄 PDF Chat" and st.session_state.vector_store is None:
-        st.warning("⚠️ Please upload a PDF first")
-        st.stop()
+        if query.strip():
 
-    if mode == "🖼️ Image Search" and image_bytes is None:
-        st.warning("⚠️ Please upload an image first")
-        st.stop()
+            with st.spinner("Thinking..."):
+                answer = multimodal_pdf_rag_pipeline(query)
 
-    if mode == "🔀 Multimodal":
-        if st.session_state.vector_store is None or image_bytes is None:
-            st.warning("⚠️ Upload BOTH PDF and Image")
-            st.stop()
+            st.markdown("### Answer")
+            st.write(answer)
 
-    # Save user message
-    st.session_state.messages.append({
-        "role": "user",
-        "content": user_input
-    })
+        else:
+            st.warning("Enter a valid question")
 
-    with st.chat_message("user"):
-        st.markdown(user_input)
 
-    # ---------------- ASSISTANT ----------------
-    with st.chat_message("assistant"):
-        with st.spinner("Thinking... 🤔"):
+# =========================
+# SIDEBAR
+# =========================
 
-            try:
-                vector_store = st.session_state.vector_store
-
-                # -------- PDF MODE --------
-                if mode == "📄 PDF Chat":
-                    response, _ = multimodal_pipeline(
-                        query=user_input,
-                        vector_store=vector_store,
-                        image_bytes=None
-                    )
-
-                # -------- IMAGE MODE (BLIP NOW) --------
-                elif mode == "🖼️ Image Search":
-                    response, _ = multimodal_pipeline(
-                        query=user_input,
-                        vector_store=None,
-                        image_bytes=image_bytes
-                    )
-
-                # -------- MULTIMODAL MODE --------
-                else:
-                    response, _ = multimodal_pipeline(
-                        query=user_input,
-                        vector_store=vector_store,
-                        image_bytes=image_bytes
-                    )
-
-                # ---------------- STREAMING ----------------
-                placeholder = st.empty()
-                streamed_text = ""
-
-                for char in response:
-                    streamed_text += char
-                    placeholder.markdown(streamed_text)
-                    time.sleep(0.01)
-
-                # Save assistant message
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": response
-                })
-
-            except Exception as e:
-                st.error(f"Error: {e}")
