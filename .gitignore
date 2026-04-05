@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+env/
+myenv/
+
+# Streamlit
+.streamlit/
+
+# Hugging Face cache
+.cache/
+huggingface/
+transformers_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+
+# FAISS index (if you save locally)
+*.faiss
+*.pkl
+
+# Logs
+*.log
